@@ -1,12 +1,10 @@
-//go:build windows
-// +build windows
-
 package conpty
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"unicode/utf16"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -152,31 +150,154 @@ func getStartupInfoExForPTY(hpc _HPCON) (*_StartupInfoEx, error) {
 	return &siEx, nil
 }
 
-func createConsoleProcessAttachedToPTY(hpc _HPCON, commandLine string) (*windows.ProcessInformation, error) {
-	cmdLine, err := windows.UTF16PtrFromString(commandLine)
+func createConsoleProcessAttachedToPTY(hpc _HPCON, binary, commandLine, workingDir string, env []string) (*windows.ProcessInformation, error) {
+	commandLineUTF, err := windows.UTF16PtrFromString(commandLine)
 	if err != nil {
 		return nil, err
 	}
+
+	var binaryUTF *uint16
+	if binary != "" {
+		binaryUTF, err = windows.UTF16PtrFromString(binary)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var workingDirUTF *uint16
+	if workingDir != "" {
+		workingDirUTF, err = windows.UTF16PtrFromString(workingDir)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	siEx, err := getStartupInfoExForPTY(hpc)
 	if err != nil {
 		return nil, err
 	}
+
+	envBlock, err := createEnvBlock(env)
+	if err != nil {
+		return nil, err
+	}
+
 	var pi windows.ProcessInformation
 	err = windows.CreateProcess(
-		nil, // use this if no args
-		cmdLine,
+		binaryUTF, // use this if no args
+		commandLineUTF,
 		nil,
 		nil,
 		false, // inheritHandle
 		windows.EXTENDED_STARTUPINFO_PRESENT,
-		nil,
-		nil,
+		envBlock,
+		workingDirUTF,
 		&siEx.startupInfo,
 		&pi)
 	if err != nil {
 		return nil, err
 	}
 	return &pi, nil
+}
+
+// createEnvBlock converts an array of environment strings into
+// the representation required by CreateProcess: a sequence of NUL
+// terminated strings followed by a nil.
+// Last bytes are two UCS-2 NULs, or four NUL bytes.
+// If any string contains a NUL, it returns (nil, EINVAL).
+func createEnvBlock(envv []string) ([]uint16, error) {
+	if len(envv) == 0 {
+		return utf16.Encode([]rune("\x00\x00")), nil
+	}
+	var length int
+	for _, s := range envv {
+		if bytealg.IndexByteString(s, 0) != -1 {
+			return nil, EINVAL
+		}
+		length += len(s) + 1
+	}
+	length += 1
+
+	b := make([]uint16, 0, length)
+	for _, s := range envv {
+		for _, c := range s {
+			b = utf16.AppendRune(b, c)
+		}
+		b = utf16.AppendRune(b, 0)
+	}
+	b = utf16.AppendRune(b, 0)
+	return b, nil
+}
+
+// makeCmdLine builds a command line out of args by escaping "special"
+// characters and joining the arguments with spaces.
+func makeCmdLine(args []string) string {
+	var b []byte
+	for _, v := range args {
+		if len(b) > 0 {
+			b = append(b, ' ')
+		}
+		b = appendEscapeArg(b, v)
+	}
+	return string(b)
+}
+
+// appendEscapeArg escapes the string s, as per escapeArg,
+// appends the result to b, and returns the updated slice.
+func appendEscapeArg(b []byte, s string) []byte {
+	if len(s) == 0 {
+		return append(b, `""`...)
+	}
+
+	needsBackslash := false
+	hasSpace := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"', '\\':
+			needsBackslash = true
+		case ' ', '\t':
+			hasSpace = true
+		}
+	}
+
+	if !needsBackslash && !hasSpace {
+		// No special handling required; normal case.
+		return append(b, s...)
+	}
+	if !needsBackslash {
+		// hasSpace is true, so we need to quote the string.
+		b = append(b, '"')
+		b = append(b, s...)
+		return append(b, '"')
+	}
+
+	if hasSpace {
+		b = append(b, '"')
+	}
+	slashes := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		default:
+			slashes = 0
+		case '\\':
+			slashes++
+		case '"':
+			for ; slashes > 0; slashes-- {
+				b = append(b, '\\')
+			}
+			b = append(b, '\\')
+		}
+		b = append(b, c)
+	}
+	if hasSpace {
+		for ; slashes > 0; slashes-- {
+			b = append(b, '\\')
+		}
+		b = append(b, '"')
+	}
+
+	return b
 }
 
 // This will only return the first error.
